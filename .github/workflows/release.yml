@@ -25,7 +25,7 @@ jobs:
 
       - name: Build standalone executable
         run: |
-          pyinstaller --onefile --noconsole --name ai-studio-agent --icon=NONE bridge.py
+          pyinstaller --onefile --name ai-studio-agent --icon=NONE bridge.py
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
