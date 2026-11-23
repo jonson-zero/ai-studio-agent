@@ -479,6 +479,7 @@ def is_safe_path(base_dir, target_rel_path):
         return False
 
 MAX_FILE_READ_SIZE = 300 * 1024  # 300 KB limit for inspect and content
+MAX_REQUEST_BODY = 20 * 1024 * 1024
 
 def read_text_file_safe(full_path, max_size=MAX_FILE_READ_SIZE):
     if not os.path.exists(full_path):
@@ -500,6 +501,77 @@ def read_text_file_safe(full_path, max_size=MAX_FILE_READ_SIZE):
 
 def normalize_newlines(text):
     return text.replace('\r\n', '\n') if text else ""
+
+class NonUtf8Error(Exception):
+    pass
+
+def read_text_exact(full_path):
+    """Strict UTF-8 read. Returns (LF text, uses_crlf)."""
+    with open(full_path, "rb") as f:
+        raw = f.read()
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise NonUtf8Error("File is not valid UTF-8 (binary or legacy encoding); refusing to modify it")
+    return text.replace("\r\n", "\n"), ("\r\n" in text)
+
+def write_text_exact(full_path, text, crlf=False):
+    os.makedirs(os.path.dirname(full_path), exist_ok=True)
+    if crlf:
+        text = text.replace("\n", "\r\n")
+    tmp = full_path + ".agent.tmp"
+    with open(tmp, "w", encoding="utf-8", newline="") as f:
+        f.write(text)
+    os.replace(tmp, full_path)
+
+_SENSITIVE_NAMES = {".npmrc", ".pypirc", ".netrc", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "credentials.json"}
+
+def is_protected_path(rel_path):
+    parts = [p for p in clean_rel_path(rel_path).replace("\\", "/").split("/") if p]
+    for part in parts:
+        low = part.lower()
+        if low == ".git":
+            return True
+        if low == ".env" or (low.startswith(".env.") and not low.endswith((".example", ".sample", ".template"))):
+            return True
+        if low in _SENSITIVE_NAMES or low.endswith((".pem", ".pfx", ".p12")):
+            return True
+    return False
+
+apply_lock = threading.RLock()
+VALID_ACTIONS = {"patch", "append", "overwrite", "delete", "mkdir"}
+
+def revert_file_entry(proj, f):
+    if not is_safe_path(proj, f["file_path"]):
+        return
+    full_path = os.path.join(proj, f["file_path"])
+    old = f.get("old_content")
+    if f.get("action") == "mkdir" or f.get("status") == "DIR":
+        if os.path.isdir(full_path):
+            try:
+                if not os.listdir(full_path):
+                    os.rmdir(full_path)
+            except Exception:
+                pass
+    elif f.get("action") == "delete" or f.get("status") == "D":
+        if old is not None:
+            write_text_exact(full_path, old, f.get("old_crlf", False))
+    elif old is None:
+        if os.path.exists(full_path):
+            os.remove(full_path)
+            parent = os.path.dirname(full_path)
+            base_real = os.path.realpath(proj)
+            while parent and os.path.realpath(parent) != base_real:
+                try:
+                    if not os.listdir(parent):
+                        os.rmdir(parent)
+                        parent = os.path.dirname(parent)
+                    else:
+                        break
+                except Exception:
+                    break
+    else:
+        write_text_exact(full_path, old, f.get("old_crlf", False))
 
 def pick_folder_subprocess():
     with browse_lock:
@@ -666,6 +738,9 @@ def run_syntax_validator(proj_path, rel_path, preset, bin_path):
     cmd_template = preset.get("validator_cmd", "").strip()
     if not cmd_template:
         return None
+    exts = preset.get("file_extensions") or ["*"]
+    if "*" not in exts and os.path.splitext(rel_path)[1].lower() not in exts:
+        return None
     try:
         norm_bin = os.path.normpath(bin_path).replace("\\", "/") if bin_path else "godot"
         norm_proj = os.path.normpath(proj_path).replace("\\", "/")
@@ -685,7 +760,7 @@ def run_syntax_validator(proj_path, rel_path, preset, bin_path):
         cmd_args = shlex.split(cmd_str, posix=(sys.platform != "win32"))
         cmd_args = [arg.strip('"\'') for arg in cmd_args]
         flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-        res = subprocess.run(cmd_args, cwd=proj_path, shell=False, capture_output=True, text=True, timeout=8, creationflags=flags)
+        res = subprocess.run(cmd_args, cwd=proj_path, shell=False, capture_output=True, text=True, timeout=30, creationflags=flags)
         out = (res.stderr + "\n" + res.stdout).strip()
         if res.returncode != 0 or "ERROR:" in out or "Error:" in out or "Compile Error:" in out or "SyntaxError:" in out:
             err_lines = [l for l in out.splitlines() if "error" in l.lower() or "warning" in l.lower() or "syntax" in l.lower()]
@@ -708,14 +783,16 @@ def apply_range_patch(old_content, anchor_start, anchor_end, new_content):
     if not start_lines or not end_lines:
         return old_content, False, "Anchors must contain non-empty lines."
 
-    start_idx = -1
-    for i in range(len(old_lines)):
-        if old_lines[i].strip() == start_lines[0]:
-            if all(i + j < len(old_lines) and old_lines[i + j].strip() == start_lines[j] for j in range(len(start_lines))):
-                start_idx = i
-                break
-    if start_idx == -1:
+    start_matches = [
+        i for i in range(len(old_lines))
+        if old_lines[i].strip() == start_lines[0]
+        and all(i + j < len(old_lines) and old_lines[i + j].strip() == start_lines[j] for j in range(len(start_lines)))
+    ]
+    if not start_matches:
         return old_content, False, f"anchor_start '{start_lines[0][:50]}' not found in file."
+    if len(start_matches) > 1:
+        return old_content, False, f"Ambiguous anchor_start '{start_lines[0][:50]}' found in {len(start_matches)} locations (lines: {[m + 1 for m in start_matches]}). Add more anchor lines."
+    start_idx = start_matches[0]
 
     search_from = start_idx + len(start_lines)
     matches = []
@@ -747,17 +824,6 @@ def apply_range_patch(old_content, anchor_start, anchor_end, new_content):
         replace_from = start_idx
         replace_to = end_idx
 
-    if False:
-        decl_re = re.compile(r'\b(?:const|let|var|def|function|class)\s+([a-zA-Z_][a-zA-Z0-9_]*)\b')
-        deleted_decls = set()
-        for dl in deleted_lines:
-            for m in decl_re.finditer(dl):
-                deleted_decls.add(m.group(1))
-        if deleted_decls:
-            lost = [v for v in deleted_decls if not re.search(r'\b' + re.escape(v) + r'\b', new_content)]
-            if lost:
-                return old_content, False, f"REJECTED: Range patch would delete declarations without re-defining them: {lost}. Use micro-patch 'search' instead."
-
     replaced = old_lines[:replace_from] + aligned_content + old_lines[replace_to:]
     res = "\n".join(replaced) + ("\n" if old_content.endswith("\n") else "")
     return res, True, f"Replaced range between line {start_idx + 1} and {end_idx}"
@@ -768,11 +834,10 @@ def apply_patch_smart(old_content, search_block, replace_block):
 
     import re
     search_block = re.sub(r'^\s*//\s*(?:pseudo anchor|actual search|search block).*$\n?', '', search_block, flags=re.MULTILINE)
-    search_block = re.sub(r'^\s*/\*.*?\*/\s*\n?', '', search_block, flags=re.DOTALL)
     if not search_block.strip():
         return old_content, False, "Search block is empty or contained only comment markers."
 
-    if ELLIPSIS_PATTERNS.search(search_block):
+    if search_block not in old_content and ELLIPSIS_PATTERNS.search(search_block):
         chunks = [c.strip() for c in ELLIPSIS_PATTERNS.split(search_block) if c.strip()]
         if len(chunks) >= 2:
             escaped = [re.escape(c) for c in chunks]
@@ -828,26 +893,31 @@ def apply_patch_smart(old_content, search_block, replace_block):
         non_empty_old = [(idx, line.strip()) for idx, line in enumerate(old_lines) if line.strip()]
         len_seq = len(non_empty_search)
         search_stripped_seq = [item[1] for item in non_empty_search]
-        for i in range(len(non_empty_old) - len_seq + 1):
-            if [non_empty_old[i + j][1] for j in range(len_seq)] == search_stripped_seq:
-                start_line_idx = non_empty_old[i][0]
-                end_line_idx = non_empty_old[i + len_seq - 1][0] + 1
+        seq_matches = [
+            i for i in range(len(non_empty_old) - len_seq + 1)
+            if [non_empty_old[i + j][1] for j in range(len_seq)] == search_stripped_seq
+        ]
+        if len(seq_matches) > 1:
+            return old_content, False, f"Ambiguous match found in {len(seq_matches)} locations ignoring indentation. Provide more unique context."
+        if len(seq_matches) == 1:
+            i = seq_matches[0]
+            start_line_idx = non_empty_old[i][0]
+            end_line_idx = non_empty_old[i + len_seq - 1][0] + 1
 
-                orig_first_line = old_lines[start_line_idx]
-                search_first_line = search_lines[non_empty_search[0][0]]
-                orig_indent = orig_first_line[:len(orig_first_line) - len(orig_first_line.lstrip())]
-                search_indent = search_first_line[:len(search_first_line) - len(search_first_line.lstrip())]
+            orig_first_line = old_lines[start_line_idx]
+            search_first_line = search_lines[non_empty_search[0][0]]
+            orig_indent = orig_first_line[:len(orig_first_line) - len(orig_first_line.lstrip())]
+            search_indent = search_first_line[:len(search_first_line) - len(search_first_line.lstrip())]
 
-                replace_lines = replace_block.splitlines()
-                adjusted_replace = []
-                for r_line in replace_lines:
-                    if r_line.strip() and r_line.startswith(search_indent):
-                        adjusted_replace.append(orig_indent + r_line[len(search_indent):])
-                    else:
-                        adjusted_replace.append(r_line)
+            adjusted_replace = []
+            for r_line in replace_block.splitlines():
+                if r_line.strip() and r_line.startswith(search_indent):
+                    adjusted_replace.append(orig_indent + r_line[len(search_indent):])
+                else:
+                    adjusted_replace.append(r_line)
 
-                new_lines = old_lines[:start_line_idx] + adjusted_replace + old_lines[end_line_idx:]
-                return "\n".join(new_lines) + ("\n" if old_content.endswith("\n") else ""), True, "Indentation-aligned match"
+            new_lines = old_lines[:start_line_idx] + adjusted_replace + old_lines[end_line_idx:]
+            return "\n".join(new_lines) + ("\n" if old_content.endswith("\n") else ""), True, "Indentation-aligned match"
 
     # 3. Fuzzy sequence match (Levenshtein / Gestalt Pattern Matching for minor typos or drift)
     if len_s >= 2 and len_s <= len(old_lines) <= 400:
@@ -856,7 +926,7 @@ def apply_patch_smart(old_content, search_block, replace_block):
         best_span = None
 
         search_clean = "\n".join(l.strip() for l in search_lines if l.strip())
-        for win_len in range(max(1, len_s - 2), min(len(old_lines) + 1, len_s + 3)):
+        for win_len in (len_s,):
             for i in range(len(old_lines) - win_len + 1):
                 win_lines = old_lines[i : i + win_len]
                 win_clean = "\n".join(l.strip() for l in win_lines if l.strip())
@@ -910,10 +980,10 @@ def simulate_changes_batch(proj, changes, confirm_delete):
     sim_files = {}
     seen_ranges = []
     for idx, item in enumerate(changes):
-        if item.get("action", "").lower() == "patch" and item.get("anchor_start") and item.get("anchor_end"):
+        if (item.get("action") or "").lower() == "patch" and item.get("anchor_start") and item.get("anchor_end"):
             astart = item.get("anchor_start").strip()
             aend = item.get("anchor_end").strip()
-            fpath = item.get("file_path", "")
+            fpath = clean_rel_path(item.get("file_path", ""))
             for (prev_path, prev_start, prev_end) in seen_ranges:
                 if prev_path == fpath and (astart == prev_end or aend == prev_start or astart == prev_start):
                     return False, [f"{fpath}: REJECTED: Overlapping or adjacent range anchors detected between patches."]
@@ -925,26 +995,39 @@ def simulate_changes_batch(proj, changes, confirm_delete):
             continue
         if not is_safe_path(proj, rel_p):
             return False, [f"{rel_p}: Security violation (unsafe path)."]
+        if is_protected_path(rel_p):
+            return False, [f"{rel_p}: Protected path (VCS internals / secrets) cannot be modified."]
 
-        act = item.get("action", "overwrite").lower()
-        cnt = normalize_newlines(item.get("content", ""))
-        srch = normalize_newlines(item.get("search", ""))
-        a_start = normalize_newlines(item.get("anchor_start", ""))
-        a_end = normalize_newlines(item.get("anchor_end", ""))
+        act = (item.get("action") or "").lower()
+        if act not in VALID_ACTIONS:
+            return False, [f"{rel_p} (change #{idx+1}): Unknown or missing action '{item.get('action')}'. Allowed: {sorted(VALID_ACTIONS)}."]
+        cnt = normalize_newlines(item.get("content") or "")
+        srch = normalize_newlines(item.get("search") or "")
+        a_start = normalize_newlines(item.get("anchor_start") or "")
+        a_end = normalize_newlines(item.get("anchor_end") or "")
         full_p = os.path.join(proj, rel_p)
+
+        if act == "mkdir":
+            if os.path.exists(full_p) and not os.path.isdir(full_p):
+                return False, [f"{rel_p} (change #{idx+1}): Cannot create directory, a file with this name exists."]
+            continue
 
         if rel_p not in sim_files:
             old_c = None
-            if os.path.exists(full_p) and not os.path.isdir(full_p):
-                with open(full_p, "r", encoding="utf-8", errors="replace") as f:
-                    old_c = normalize_newlines(f.read())
+            if os.path.isdir(full_p):
+                return False, [f"{rel_p} (change #{idx+1}): Path is a directory, not a file."]
+            if os.path.exists(full_p):
+                try:
+                    old_c, _ = read_text_exact(full_p)
+                except NonUtf8Error as e:
+                    return False, [f"{rel_p} (change #{idx+1}): {e}."]
+                except OSError as e:
+                    return False, [f"{rel_p} (change #{idx+1}): Read error: {e}"]
             sim_files[rel_p] = old_c
 
         cur_c = sim_files[rel_p]
 
-        if act == "mkdir":
-            continue
-        elif act == "delete":
+        if act == "delete":
             if not item.get("confirmed", False) and not confirm_delete:
                 return False, [f"{rel_p}: Deletion blocked (explicit user confirmation required)."]
             sim_files[rel_p] = None
@@ -961,8 +1044,12 @@ def simulate_changes_batch(proj, changes, confirm_delete):
                 return False, [f"{rel_p} (change #{idx+1}): {diag}"]
             sim_files[rel_p] = new_c
         elif act == "append":
+            if not cnt:
+                return False, [f"{rel_p} (change #{idx+1}): Append rejected because 'content' is missing or empty."]
             sim_files[rel_p] = (cur_c + "\n" if cur_c else "") + cnt + "\n"
-        else:
+        else:  # overwrite
+            if not cnt and cur_c:
+                return False, [f"{rel_p} (change #{idx+1}): Overwrite with empty 'content' would erase an existing non-empty file. Use action 'delete' if that is intended."]
             sim_files[rel_p] = cnt
 
     return True, []
@@ -1807,7 +1894,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       recentSel.dataset.cache = serialized;
       const curSelected = recentSel.value || currentPath || '';
       recentSel.innerHTML = '<option value="">-- Select from recent workspaces --</option>' +
-        recentProjects.map(p => `<option value="${p}">${p}</option>`).join('');
+        recentProjects.map(p => `<option value="${escapeHtml(p)}">${escapeHtml(p)}</option>`).join('');
       syncRecentWithInput(curSelected);
     }
   }
@@ -2182,7 +2269,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
     const hSel = document.getElementById('selPresetHeader');
     const eSel = document.getElementById('selPresetEditor');
     const opts = Object.values(cachedPresets).map(p => 
-      `<option value="${p.id}">${p.name || p.id}</option>`
+      `<option value="${escapeHtml(p.id)}">${escapeHtml(p.name || p.id)}</option>`
     ).join('');
     
     hSel.innerHTML = opts;
@@ -2271,19 +2358,19 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
         const newerUnreverted = currentTransactionsCache.slice(0, idx).filter(x => !x.reverted).length;
         return `
         <div class="trans-card">
-          <div class="trans-header" onclick="toggleTransaction('${t.id}')">
+          <div class="trans-header" onclick="toggleTransaction(${escapeHtml(JSON.stringify(String(t.id)))})">
             <div class="trans-meta">
               <span class="toggle-icon">${isTransCollapsed ? '▶' : '▼'}</span>
               <span class="trans-badge ${t.reverted ? 'badge-reverted' : 'badge-applied'}">${t.reverted ? 'REVERTED' : 'APPLIED'}</span>
-              <span class="trans-time">${t.timestamp}</span>
+              <span class="trans-time">${escapeHtml(t.timestamp)}</span>
               <span class="stat-plus">+${t.total_additions || 0}</span>
               <span class="stat-minus">-${t.total_deletions || 0}</span>
               <span style="color:var(--text-secondary);">(${t.files.length} file${t.files.length === 1 ? '' : 's'})</span>
             </div>
             <div style="display:flex; align-items:center; gap:6px;" onclick="event.stopPropagation();">
               ${t.reverted ? '' : `
-                <button class="btn btn-danger-ghost" style="padding:3px 8px; font-size:11.5px;" title="Revert only this single request without cascading" onclick="revertTransaction('${t.id}', true)">Revert Batch</button>
-                ${newerUnreverted > 0 ? `<button class="btn btn-danger-ghost" style="padding:3px 8px; font-size:11.5px; opacity:0.85;" title="Cascade revert including newer requests" onclick="revertTransaction('${t.id}', false)">Cascade (${newerUnreverted + 1})</button>` : ''}
+                <button class="btn btn-danger-ghost" style="padding:3px 8px; font-size:11.5px;" title="Revert only this single request without cascading" onclick="revertTransaction(${escapeHtml(JSON.stringify(String(t.id)))}, true)">Revert Batch</button>
+                ${newerUnreverted > 0 ? `<button class="btn btn-danger-ghost" style="padding:3px 8px; font-size:11.5px; opacity:0.85;" title="Cascade revert including newer requests" onclick="revertTransaction(${escapeHtml(JSON.stringify(String(t.id)))}, false)">Cascade (${newerUnreverted + 1})</button>` : ''}
               `}
             </div>
           </div>
@@ -2295,7 +2382,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
                 const isFileCollapsed = collapsedFiles.has(fKey);
                 return `
                 <div class="diff-file-card">
-                  <div class="diff-file-bar" onclick="toggleFile('${fKey}')">
+                  <div class="diff-file-bar" onclick="toggleFile(${escapeHtml(JSON.stringify(String(fKey)))})">
                     <div style="display:flex; align-items:center; gap:8px;">
                       <span class="toggle-icon">${isFileCollapsed ? '▶' : '▼'}</span>
                       <span class="diff-badge ${f.status === 'DIR' || f.action === 'mkdir' ? 'diff-badge-dir' : f.status === 'A' ? 'diff-badge-a' : f.status === 'D' ? 'diff-badge-d' : 'diff-badge-m'}">${f.status === 'DIR' || f.action === 'mkdir' ? 'DIR' : f.status === 'A' ? 'NEW' : f.status === 'D' ? 'DEL' : 'MOD'}</span>
@@ -2307,7 +2394,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
                         <span class="stat-plus">+${f.additions || 0}</span>
                         <span class="stat-minus">-${f.deletions || 0}</span>
                       </div>
-                      ${f.reverted ? '<span style="font-size:10px; color:var(--red); font-weight:700;">REVERTED</span>' : `<button class="btn btn-danger-ghost" style="padding:2px 6px; font-size:11px;" onclick="event.stopPropagation(); revertFile('${t.id}', '${f.file_path}')">Revert File</button>`}
+                      ${f.reverted ? '<span style="font-size:10px; color:var(--red); font-weight:700;">REVERTED</span>' : `<button class="btn btn-danger-ghost" style="padding:2px 6px; font-size:11px;" onclick="event.stopPropagation(); revertFile(${escapeHtml(JSON.stringify(String(t.id)))}, ${escapeHtml(JSON.stringify(String(f.file_path)))})">Revert File</button>`}
                     </div>
                   </div>
                   <div id="file-diff-${fKey}" class="diff-code" style="display: ${isFileCollapsed ? 'none' : 'block'};">
@@ -2352,8 +2439,13 @@ class AgentBridgeHandler(http.server.BaseHTTPRequestHandler):
             return True
         if origin in ALLOWED_ORIGINS:
             return True
-        parsed = urllib.parse.urlparse(origin)
-        return parsed.hostname in ('127.0.0.1', 'localhost')
+        # AI Studio and this dashboard only
+        return origin in (f"http://127.0.0.1:{ACTIVE_PORT}", f"http://localhost:{ACTIVE_PORT}")
+
+    def _is_host_allowed(self):
+        # blocks DNS rebinding
+        host = (self.headers.get('Host') or '').strip().lower()
+        return host in (f"127.0.0.1:{ACTIVE_PORT}", f"localhost:{ACTIVE_PORT}", "127.0.0.1", "localhost")
 
     def _set_headers(self, status=200, content_type='application/json'):
         self.send_response(status)
@@ -2368,7 +2460,8 @@ class AgentBridgeHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
     def log_message(self, format, *args):
-        if any(api in (args[0] if args else "") for api in ["/api/status", "/api/history", "/api/files"]):
+        first = args[0] if args and isinstance(args[0], str) else ""
+        if any(api in first for api in ["/api/status", "/api/history", "/api/files"]):
             return
         super().log_message(format, *args)
 
@@ -2378,6 +2471,11 @@ class AgentBridgeHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
+
+        if not self._is_host_allowed():
+            self._set_headers(403)
+            self.wfile.write(b'{"error":"Host Forbidden"}')
+            return
 
         if path in ["/", "/dashboard"]:
             self._set_headers(200, 'text/html; charset=utf-8')
@@ -2487,7 +2585,7 @@ class AgentBridgeHandler(http.server.BaseHTTPRequestHandler):
             with state_lock:
                 proj = config.get("project_path", "")
 
-            if not is_safe_path(proj, rel_path):
+            if not is_safe_path(proj, rel_path) or is_protected_path(rel_path):
                 self._set_headers(403)
                 self.wfile.write(b'{"error":"Forbidden path"}')
                 return
@@ -2506,14 +2604,21 @@ class AgentBridgeHandler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         global latest_ai_message
-        if not self._is_origin_allowed():
+        if not self._is_origin_allowed() or not self._is_host_allowed():
             self._set_headers(403)
             self.wfile.write(b'{"error":"Cross-Origin Forbidden"}')
             return
 
         parsed = urllib.parse.urlparse(self.path)
-        content_length = int(self.headers.get('Content-Length', 0))
-        post_data = self.rfile.read(content_length).decode('utf-8')
+        try:
+            content_length = int(self.headers.get('Content-Length', 0))
+            if content_length < 0 or content_length > MAX_REQUEST_BODY:
+                raise ValueError("bad length")
+            post_data = self.rfile.read(content_length).decode('utf-8')
+        except (ValueError, UnicodeDecodeError):
+            self._set_headers(400)
+            self.wfile.write(b'{"error":"Invalid or oversized request body"}')
+            return
 
         if parsed.path == "/api/browse_folder":
             folder = pick_folder_subprocess()
@@ -2636,10 +2741,10 @@ class AgentBridgeHandler(http.server.BaseHTTPRequestHandler):
                         new_p = req["path"].strip()
                         if new_p:
                             norm_p = os.path.normpath(new_p).replace("\\", "/")
-                            try:
-                                os.makedirs(norm_p, exist_ok=True)
-                            except Exception as e:
-                                print(f"[WARN] Could not create project folder '{norm_p}': {e}")
+                            if not os.path.isdir(norm_p):
+                                self._set_headers(400)
+                                self.wfile.write(b'{"error":"Project folder does not exist"}')
+                                return
                             config["project_path"] = norm_p
                             add_recent_project(norm_p)
                         else:
@@ -2649,8 +2754,10 @@ class AgentBridgeHandler(http.server.BaseHTTPRequestHandler):
                     save_config(config)
 
                     if "system_instruction" in req:
-                        preset = get_active_preset_data()
+                        preset = dict(get_active_preset_data())
                         preset["system_instruction"] = req["system_instruction"]
+                        if preset["id"] in BUILTIN_PRESETS:
+                            preset["user_modified"] = True
                         pf = os.path.join(PRESETS_DIR, f"{preset['id']}.json")
                         with open(pf, "w", encoding="utf-8") as f:
                             json.dump(preset, f, ensure_ascii=False, indent=2)
@@ -2728,37 +2835,7 @@ class AgentBridgeHandler(http.server.BaseHTTPRequestHandler):
                             self.wfile.write(b'{"error":"Security violation"}')
                             return
 
-                        full_path = os.path.join(proj, matched_file["file_path"])
-                        if matched_file.get("action") == "mkdir" or matched_file.get("status") == "DIR":
-                            if os.path.isdir(full_path):
-                                try:
-                                    if not os.listdir(full_path):
-                                        os.rmdir(full_path)
-                                except Exception:
-                                    pass
-                        elif matched_file.get("action") == "delete" or matched_file.get("status") == "D":
-                            if matched_file.get("old_content") is not None:
-                                os.makedirs(os.path.dirname(full_path), exist_ok=True)
-                                with open(full_path, "w", encoding="utf-8") as file_out:
-                                    file_out.write(matched_file["old_content"])
-                        elif matched_file.get("old_content") is None:
-                            if os.path.exists(full_path):
-                                os.remove(full_path)
-                                parent = os.path.dirname(full_path)
-                                base_real = os.path.realpath(proj)
-                                while parent and os.path.realpath(parent) != base_real:
-                                    try:
-                                        if not os.listdir(parent):
-                                            os.rmdir(parent)
-                                            parent = os.path.dirname(parent)
-                                        else:
-                                            break
-                                    except Exception:
-                                        break
-                        else:
-                            os.makedirs(os.path.dirname(full_path), exist_ok=True)
-                            with open(full_path, "w", encoding="utf-8") as file_out:
-                                file_out.write(matched_file["old_content"])
+                        revert_file_entry(proj, matched_file)
 
                         for f in matching_files:
                             f["reverted"] = True
@@ -2769,6 +2846,11 @@ class AgentBridgeHandler(http.server.BaseHTTPRequestHandler):
                         print(f"[POINT REVERT] File {target_file_path} in batch {trans_id}")
                         self._set_headers(200)
                         self.wfile.write(json.dumps({"status": "ok", "reverted_file": target_file_path, "target_id": trans_id}).encode('utf-8'))
+                        return
+
+                    if target_idx == -1:
+                        self._set_headers(404)
+                        self.wfile.write(b'{"error":"Transaction not found"}')
                         return
 
                     isolated = req.get("isolated", False)
@@ -2784,37 +2866,7 @@ class AgentBridgeHandler(http.server.BaseHTTPRequestHandler):
                                 continue
                             if not is_safe_path(proj, f["file_path"]):
                                 continue
-                            full_path = os.path.join(proj, f["file_path"])
-                            if f.get("action") == "mkdir" or f.get("status") == "DIR":
-                                if os.path.isdir(full_path):
-                                    try:
-                                        if not os.listdir(full_path):
-                                            os.rmdir(full_path)
-                                    except Exception:
-                                        pass
-                            elif f.get("action") == "delete" or f.get("status") == "D":
-                                if f.get("old_content") is not None:
-                                    os.makedirs(os.path.dirname(full_path), exist_ok=True)
-                                    with open(full_path, "w", encoding="utf-8") as file_out:
-                                        file_out.write(f["old_content"])
-                            elif f.get("old_content") is None:
-                                if os.path.exists(full_path):
-                                    os.remove(full_path)
-                                    parent = os.path.dirname(full_path)
-                                    base_real = os.path.realpath(proj)
-                                    while parent and os.path.realpath(parent) != base_real:
-                                        try:
-                                            if not os.listdir(parent):
-                                                os.rmdir(parent)
-                                                parent = os.path.dirname(parent)
-                                            else:
-                                                break
-                                        except Exception:
-                                            break
-                            else:
-                                os.makedirs(os.path.dirname(full_path), exist_ok=True)
-                                with open(full_path, "w", encoding="utf-8") as file_out:
-                                    file_out.write(f["old_content"])
+                            revert_file_entry(proj, f)
                             f["reverted"] = True
 
                         item["reverted"] = True
@@ -2836,37 +2888,7 @@ class AgentBridgeHandler(http.server.BaseHTTPRequestHandler):
                             if not is_safe_path(proj, f["file_path"]):
                                 continue
 
-                            full_path = os.path.join(proj, f["file_path"])
-                            if f.get("action") == "mkdir" or f.get("status") == "DIR":
-                                if os.path.isdir(full_path):
-                                    try:
-                                        if not os.listdir(full_path):
-                                            os.rmdir(full_path)
-                                    except Exception:
-                                        pass
-                            elif f.get("action") == "delete" or f.get("status") == "D":
-                                if f.get("old_content") is not None:
-                                    os.makedirs(os.path.dirname(full_path), exist_ok=True)
-                                    with open(full_path, "w", encoding="utf-8") as file_out:
-                                        file_out.write(f["old_content"])
-                            elif f.get("old_content") is None:
-                                if os.path.exists(full_path):
-                                    os.remove(full_path)
-                                    parent = os.path.dirname(full_path)
-                                    base_real = os.path.realpath(proj)
-                                    while parent and os.path.realpath(parent) != base_real:
-                                        try:
-                                            if not os.listdir(parent):
-                                                os.rmdir(parent)
-                                                parent = os.path.dirname(parent)
-                                            else:
-                                                break
-                                        except Exception:
-                                            break
-                            else:
-                                os.makedirs(os.path.dirname(full_path), exist_ok=True)
-                                with open(full_path, "w", encoding="utf-8") as file_out:
-                                    file_out.write(f["old_content"])
+                            revert_file_entry(proj, f)
                             f["reverted"] = True
 
                         item["reverted"] = True
@@ -2958,6 +2980,7 @@ class AgentBridgeHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(b'{"error":"Endpoint not found"}')
             return
 
+        apply_lock.acquire()
         try:
             data = json.loads(post_data)
             thought_text = data.get("thought", "")
@@ -2983,6 +3006,9 @@ class AgentBridgeHandler(http.server.BaseHTTPRequestHandler):
                     rf_clean = clean_rel_path(rf)
                     if not is_safe_path(proj, rf_clean):
                         inspected_data[rf_clean] = "[Error: Unsafe file path]"
+                        continue
+                    if is_protected_path(rf_clean):
+                        inspected_data[rf_clean] = "[Error: Protected path (VCS internals / secrets) is not readable]"
                         continue
                     full_p = os.path.join(proj, rf_clean)
                     c_text, c_err = read_text_file_safe(full_p)
@@ -3043,160 +3069,171 @@ class AgentBridgeHandler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(json.dumps(resp_payload).encode('utf-8'))
                 return
 
-            for item in changes:
-                action = item.get("action", "overwrite").lower()
-                rel_path = clean_rel_path(item.get("file_path", ""))
-                content = normalize_newlines(item.get("content", ""))
-                search = normalize_newlines(item.get("search", ""))
-                anchor_start = normalize_newlines(item.get("anchor_start", ""))
-                anchor_end = normalize_newlines(item.get("anchor_end", ""))
-                comment = item.get("comment", "")
+            try:
+                for item in changes:
+                    action = (item.get("action") or "overwrite").lower()
+                    rel_path = clean_rel_path(item.get("file_path", ""))
+                    content = normalize_newlines(item.get("content", ""))
+                    search = normalize_newlines(item.get("search", ""))
+                    anchor_start = normalize_newlines(item.get("anchor_start", ""))
+                    anchor_end = normalize_newlines(item.get("anchor_end", ""))
+                    comment = item.get("comment", "")
 
-                if not rel_path:
-                    continue
-
-                if not is_safe_path(proj, rel_path):
-                    errors.append(f"{rel_path}: Security violation")
-                    continue
-
-                full_path = os.path.join(proj, rel_path)
-                os.makedirs(os.path.dirname(full_path), exist_ok=True)
-
-                old_content = None
-                is_new_file = not os.path.exists(full_path)
-                if not is_new_file:
-                    with open(full_path, "r", encoding="utf-8", errors="replace") as f:
-                        old_content = normalize_newlines(f.read())
-
-                dir_path = os.path.dirname(rel_path).replace("\\", "/")
-
-                if action == "mkdir":
-                    dir_created = not os.path.exists(full_path)
-                    os.makedirs(full_path, exist_ok=True)
-                    transaction_files.append({
-                        "file_path": rel_path,
-                        "dir_path": rel_path,
-                        "file_name": os.path.basename(rel_path),
-                        "ext": "",
-                        "status": "DIR",
-                        "action": "mkdir",
-                        "comment": comment or "Created directory",
-                        "old_content": None,
-                        "diff": f"# Directory created: {rel_path}\n" if dir_created else f"# Directory already exists: {rel_path}\n",
-                        "additions": 0,
-                        "deletions": 0,
-                        "syntax_error": None,
-                        "reverted": False
-                    })
-                    updated.append(rel_path)
-                    print(f"[APPLY] [MKDIR] {rel_path} ({comment})")
-                    continue
-
-                if action == "delete":
-                    if not item.get("confirmed", False) and not data.get("confirm_delete", False):
-                        errors.append(f"{rel_path}: Deletion blocked (user confirmation required)")
-                        print(f"[BLOCKED] Deletion of {rel_path} without explicit user confirmation")
+                    if not rel_path:
                         continue
-                    if old_content is None:
+
+                    if not is_safe_path(proj, rel_path):
+                        errors.append(f"{rel_path}: Security violation")
                         continue
-                    old_lines = old_content.splitlines(keepends=True)
-                    diff = "".join(difflib.unified_diff(old_lines, [], fromfile=f"a/{rel_path}", tofile="/dev/null"))
-                    deletions = len(old_lines)
+
+                    full_path = os.path.join(proj, rel_path)
+
+                    old_content = None
+                    old_crlf = False
+                    is_new_file = not os.path.exists(full_path)
+                    if not is_new_file and not os.path.isdir(full_path):
+                        old_content, old_crlf = read_text_exact(full_path)
+
+                    dir_path = os.path.dirname(rel_path).replace("\\", "/")
+
+                    if action == "mkdir":
+                        dir_created = not os.path.exists(full_path)
+                        os.makedirs(full_path, exist_ok=True)
+                        transaction_files.append({
+                            "file_path": rel_path,
+                            "dir_path": rel_path,
+                            "file_name": os.path.basename(rel_path),
+                            "ext": "",
+                            "status": "DIR",
+                            "action": "mkdir",
+                            "comment": comment or "Created directory",
+                            "old_content": None,
+                            "diff": f"# Directory created: {rel_path}\n" if dir_created else f"# Directory already exists: {rel_path}\n",
+                            "additions": 0,
+                            "deletions": 0,
+                            "syntax_error": None,
+                            "reverted": False
+                        })
+                        updated.append(rel_path)
+                        print(f"[APPLY] [MKDIR] {rel_path} ({comment})")
+                        continue
+
+                    if action == "delete":
+                        if not item.get("confirmed", False) and not data.get("confirm_delete", False):
+                            errors.append(f"{rel_path}: Deletion blocked (user confirmation required)")
+                            print(f"[BLOCKED] Deletion of {rel_path} without explicit user confirmation")
+                            continue
+                        if old_content is None:
+                            continue
+                        old_lines = old_content.splitlines(keepends=True)
+                        diff = "".join(difflib.unified_diff(old_lines, [], fromfile=f"a/{rel_path}", tofile="/dev/null"))
+                        deletions = len(old_lines)
+                        total_deletions += deletions
+
+                        os.remove(full_path)
+                        parent = os.path.dirname(full_path)
+                        base_real = os.path.realpath(proj)
+                        while parent and os.path.realpath(parent) != base_real:
+                            try:
+                                if not os.listdir(parent):
+                                    os.rmdir(parent)
+                                    parent = os.path.dirname(parent)
+                                else:
+                                    break
+                            except Exception:
+                                break
+
+                        transaction_files.append({
+                            "file_path": rel_path,
+                            "dir_path": dir_path,
+                            "file_name": os.path.basename(rel_path),
+                            "ext": os.path.splitext(rel_path)[1].lower(),
+                            "status": "D",
+                            "action": "delete",
+                            "comment": comment or "Deleted file",
+                            "old_content": old_content,
+                            "old_crlf": old_crlf,
+                            "diff": diff,
+                            "additions": 0,
+                            "deletions": deletions,
+                            "syntax_error": None,
+                            "reverted": False
+                        })
+                        updated.append(rel_path)
+                        print(f"[APPLY] [DELETE] {rel_path} ({comment})")
+                        continue
+
+                    new_content = ""
+                    if action == "patch":
+                        if not content:
+                            errors.append(f"{rel_path}: Patch rejected because 'content' is missing or empty.")
+                            continue
+                        if old_content is None:
+                            errors.append(f"{rel_path}: File does not exist to patch")
+                            continue
+                        if anchor_start and anchor_end:
+                            new_content, success, diag = apply_range_patch(old_content, anchor_start, anchor_end, content)
+                        else:
+                            new_content, success, diag = apply_patch_smart(old_content, search, content)
+                        if not success:
+                            print(f"[FAIL] Target patch failed in {rel_path}: {diag}")
+                            errors.append(f"{rel_path}: {diag}")
+                            continue
+                    elif action == "append":
+                        new_content = (old_content + "\n" if old_content else "") + content + "\n"
+                    else:
+                        new_content = content
+
+                    old_lines = old_content.splitlines(keepends=True) if old_content else []
+                    new_lines = new_content.splitlines(keepends=True)
+                    diff = "".join(difflib.unified_diff(old_lines, new_lines, fromfile=f"a/{rel_path}", tofile=f"b/{rel_path}"))
+
+                    additions = sum(1 for l in diff.splitlines() if l.startswith('+') and not l.startswith('+++'))
+                    deletions = sum(1 for l in diff.splitlines() if l.startswith('-') and not l.startswith('---'))
+
+                    total_additions += additions
                     total_deletions += deletions
 
-                    os.remove(full_path)
-                    parent = os.path.dirname(full_path)
-                    base_real = os.path.realpath(proj)
-                    while parent and os.path.realpath(parent) != base_real:
-                        try:
-                            if not os.listdir(parent):
-                                os.rmdir(parent)
-                                parent = os.path.dirname(parent)
-                            else:
-                                break
-                        except Exception:
-                            break
+                    write_text_exact(full_path, new_content, old_crlf)
+
+                    err = run_syntax_validator(proj, rel_path, preset, bin_path)
+                    if err:
+                        syntax_warnings.append(f"{rel_path}: {err}")
+                        print(f"[WARN] Validation: {rel_path} - {err}")
+
+                    status_code = "A" if is_new_file else "M"
+                    dir_path = os.path.dirname(rel_path).replace("\\", "/")
 
                     transaction_files.append({
+                        "change_index": len(transaction_files),
                         "file_path": rel_path,
                         "dir_path": dir_path,
                         "file_name": os.path.basename(rel_path),
                         "ext": os.path.splitext(rel_path)[1].lower(),
-                        "status": "D",
-                        "action": "delete",
-                        "comment": comment or "Deleted file",
+                        "status": status_code,
+                        "action": action,
+                        "comment": comment,
                         "old_content": old_content,
+                        "old_crlf": old_crlf,
                         "diff": diff,
-                        "additions": 0,
+                        "additions": additions,
                         "deletions": deletions,
-                        "syntax_error": None,
+                        "syntax_error": err,
                         "reverted": False
                     })
+
                     updated.append(rel_path)
-                    print(f"[APPLY] [DELETE] {rel_path} ({comment})")
-                    continue
-
-                new_content = ""
-                if action == "patch":
-                    if not content:
-                        errors.append(f"{rel_path}: Patch rejected because 'content' is missing or empty.")
-                        continue
-                    if old_content is None:
-                        errors.append(f"{rel_path}: File does not exist to patch")
-                        continue
-                    if anchor_start and anchor_end:
-                        new_content, success, diag = apply_range_patch(old_content, anchor_start, anchor_end, content)
-                    else:
-                        new_content, success, diag = apply_patch_smart(old_content, search, content)
-                    if not success:
-                        print(f"[FAIL] Target patch failed in {rel_path}: {diag}")
-                        errors.append(f"{rel_path}: {diag}")
-                        continue
-                elif action == "append":
-                    new_content = (old_content + "\n" if old_content else "") + content + "\n"
-                else:
-                    new_content = content
-
-                old_lines = old_content.splitlines(keepends=True) if old_content else []
-                new_lines = new_content.splitlines(keepends=True)
-                diff = "".join(difflib.unified_diff(old_lines, new_lines, fromfile=f"a/{rel_path}", tofile=f"b/{rel_path}"))
-
-                additions = sum(1 for l in diff.splitlines() if l.startswith('+') and not l.startswith('+++'))
-                deletions = sum(1 for l in diff.splitlines() if l.startswith('-') and not l.startswith('---'))
-
-                total_additions += additions
-                total_deletions += deletions
-
-                with open(full_path, "w", encoding="utf-8") as f:
-                    f.write(new_content)
-
-                err = run_syntax_validator(proj, rel_path, preset, bin_path)
-                if err:
-                    syntax_warnings.append(f"{rel_path}: {err}")
-                    print(f"[WARN] Validation: {rel_path} - {err}")
-
-                status_code = "A" if is_new_file else "M"
-                dir_path = os.path.dirname(rel_path).replace("\\", "/")
-
-                transaction_files.append({
-                    "change_index": len(transaction_files),
-                    "file_path": rel_path,
-                    "dir_path": dir_path,
-                    "file_name": os.path.basename(rel_path),
-                    "ext": os.path.splitext(rel_path)[1].lower(),
-                    "status": status_code,
-                    "action": action,
-                    "comment": comment,
-                    "old_content": old_content,
-                    "diff": diff,
-                    "additions": additions,
-                    "deletions": deletions,
-                    "syntax_error": err,
-                    "reverted": False
-                })
-
-                updated.append(rel_path)
-                print(f"[APPLY] [{action.upper()}] {rel_path} ({comment})")
+                    print(f"[APPLY] [{action.upper()}] {rel_path} ({comment})")
+            except Exception as apply_exc:
+                for tf in reversed(transaction_files):
+                    try:
+                        revert_file_entry(proj, tf)
+                    except Exception:
+                        pass
+                print(f"[ERROR] Apply failed, rolled back {len(transaction_files)} change(s): {apply_exc}")
+                self._set_headers(200)
+                self.wfile.write(json.dumps({"status": "error", "updated": [], "errors": [f"ATOMIC TRANSACTION FAILED: {apply_exc}. All changes made so far were rolled back."], "warnings": []}).encode("utf-8"))
+                return
 
             trans_entry = None
             if transaction_files:
@@ -3234,6 +3271,8 @@ class AgentBridgeHandler(http.server.BaseHTTPRequestHandler):
             print(f"[ERROR] Server Exception: {e}")
             self._set_headers(500)
             self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
+        finally:
+            apply_lock.release()
 
 def create_server(target_port):
     http.server.ThreadingHTTPServer.allow_reuse_address = True
