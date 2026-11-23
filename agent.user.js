@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         AI Studio Agent
 // @namespace    http://tampermonkey.net/
-// @version      1.0
+// @version      1.0.1
 // @description  Zero-API-cost Local Coding Agent
-// @updateURL    https://raw.githubusercontent.com/jonson-zero/ai-studio-agent/main/agent.user.js
-// @downloadURL  https://raw.githubusercontent.com/jonson-zero/ai-studio-agent/main/agent.user.js
+// @updateURL    https://github.com/jonson-zero/ai-studio-agent/releases/latest/download/agent.user.js
+// @downloadURL  https://github.com/jonson-zero/ai-studio-agent/releases/latest/download/agent.user.js
 // @match        https://aistudio.google.com/*
 // @noframes
 // @run-at       document-idle
@@ -24,7 +24,7 @@
     }
 
     const SERVICE_NAME = "ai-studio-agent";
-    const SCRIPT_VERSION = "1.0";
+    const SCRIPT_VERSION = "1.0.1";
     const MAX_AUTO_INSPECT = 4;
     const MAX_PATCH_RETRIES = 2;
     let patchRetryCount = 0;

@@ -53,7 +53,7 @@ flowchart LR
 
 ### 1. Browser Extension
 1. Install [Tampermonkey](https://www.tampermonkey.net/) in your browser.
-2. Install the userscript from [**agent.user.js**](https://raw.githubusercontent.com/jonson-zero/ai-studio-agent/main/agent.user.js).
+2. Install the userscript from [**agent.user.js**](https://github.com/jonson-zero/ai-studio-agent/releases/latest/download/agent.user.js).
 
 ### 2. Local Bridge Server
 

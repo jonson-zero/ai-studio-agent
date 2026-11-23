@@ -11,6 +11,9 @@ permissions:
 jobs:
   build-windows:
     runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -20,17 +23,39 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Verify versions match the tag
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          grep -q "^VERSION = \"$TAG\"" bridge.py || { echo "bridge.py VERSION != $TAG"; exit 1; }
+          grep -q "const SCRIPT_VERSION = \"$TAG\"" agent.user.js || { echo "SCRIPT_VERSION != $TAG"; exit 1; }
+          grep -qE "^// @version +$TAG\s*$" agent.user.js || { echo "@version != $TAG"; exit 1; }
+
+      - name: Syntax checks
+        run: |
+          python -m py_compile bridge.py
+          node --check agent.user.js
+
       - name: Install PyInstaller
         run: pip install pyinstaller
 
       - name: Build standalone executable
         run: |
-          pyinstaller --onefile --name ai-studio-agent --icon=NONE bridge.py
+          pyinstaller --onefile --name ai-studio-agent --icon=NONE --add-data "agent.user.js;." bridge.py
+
+      - name: Collect release assets and checksums
+        run: |
+          cp agent.user.js dist/agent.user.js
+          cd dist
+          sha256sum ai-studio-agent.exe agent.user.js > SHA256SUMS.txt
+          cat SHA256SUMS.txt
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/ai-studio-agent.exe
+          files: |
+            dist/ai-studio-agent.exe
+            dist/agent.user.js
+            dist/SHA256SUMS.txt
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -21,7 +21,7 @@ import re
 DEFAULT_PORT = 9099
 SERVICE_NAME = "ai-studio-agent"
 APP_DISPLAY_NAME = "AI Studio Agent"
-VERSION = "1.0"
+VERSION = "1.0.1"
 MIN_USERSCRIPT_VERSION = "1.0"
 OFFICIAL_REPO = "jonson-zero/ai-studio-agent"
 last_known_script_ver = ""
@@ -329,7 +329,15 @@ def check_github_update(repo=None, force=False):
     return update_cache
 
 def get_userscript_url():
-    return f"https://raw.githubusercontent.com/{OFFICIAL_REPO}/main/agent.user.js"
+    return f"https://github.com/{OFFICIAL_REPO}/releases/latest/download/agent.user.js"
+
+def find_local_userscript():
+    for base in (getattr(sys, "_MEIPASS", None), get_app_dir()):
+        if base:
+            cand = os.path.join(base, "agent.user.js")
+            if os.path.isfile(cand):
+                return cand
+    return None
 
 def load_config():
     defaults = {
@@ -573,106 +581,156 @@ def revert_file_entry(proj, f):
     else:
         write_text_exact(full_path, old, f.get("old_crlf", False))
 
+PICKER_TIMEOUT = 600
+
+_PS_FOLDER_PICKER = r"""
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class FolderPicker {
+    [ComImport, Guid("DC1C5A9C-E88A-4dde-A5A1-60F82A20AEF7")] class FileOpenDialogRCW {}
+    [ComImport, Guid("42f85136-db7e-439c-85f1-e4075d135fc8"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IFileDialog {
+        [PreserveSig] int Show(IntPtr parent);
+        void SetFileTypes(uint c, IntPtr f);
+        void SetFileTypeIndex(uint i);
+        void GetFileTypeIndex(out uint i);
+        void Advise(IntPtr p, out uint c);
+        void Unadvise(uint c);
+        void SetOptions(uint fos);
+        void GetOptions(out uint fos);
+        void SetDefaultFolder(IShellItem psi);
+        void SetFolder(IShellItem psi);
+        void GetFolder(out IShellItem psi);
+        void GetCurrentSelection(out IShellItem psi);
+        void SetFileName([MarshalAs(UnmanagedType.LPWStr)] string n);
+        void GetFileName([MarshalAs(UnmanagedType.LPWStr)] out string n);
+        void SetTitle([MarshalAs(UnmanagedType.LPWStr)] string t);
+        void SetOkButtonLabel([MarshalAs(UnmanagedType.LPWStr)] string t);
+        void SetFileNameLabel([MarshalAs(UnmanagedType.LPWStr)] string t);
+        void GetResult(out IShellItem psi);
+    }
+    [ComImport, Guid("43826d1e-e718-42ee-bc55-a1e261c37bfe"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IShellItem {
+        void BindToHandler(IntPtr pbc, ref Guid bhid, ref Guid riid, out IntPtr ppv);
+        void GetParent(out IShellItem psi);
+        void GetDisplayName(uint sigdn, [MarshalAs(UnmanagedType.LPWStr)] out string name);
+        void GetAttributes(uint mask, out uint attrs);
+        void Compare(IShellItem psi, uint hint, out int order);
+    }
+    public static string Pick(IntPtr owner, string title) {
+        IFileDialog d = (IFileDialog)new FileOpenDialogRCW();
+        uint opts; d.GetOptions(out opts);
+        d.SetOptions(opts | 0x20 | 0x40 | 0x800);
+        d.SetTitle(title);
+        if (d.Show(owner) != 0) return "";
+        IShellItem item; d.GetResult(out item);
+        string path; item.GetDisplayName(0x80058000, out path);
+        return path;
+    }
+}
+'@
+$top = New-Object System.Windows.Forms.Form
+$top.TopMost = $true
+$top.ShowInTaskbar = $false
+$top.FormBorderStyle = 'None'
+$top.StartPosition = 'CenterScreen'
+$top.Size = New-Object System.Drawing.Size(1, 1)
+$top.Opacity = 0
+$top.Show()
+$top.Activate()
+try {
+    $r = [FolderPicker]::Pick($top.Handle, 'Select Project Workspace Directory')
+    if ($r) { [Console]::Out.WriteLine($r) }
+} finally { $top.Dispose() }
+"""
+
+_PS_FILE_PICKER = r"""
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+$top = New-Object System.Windows.Forms.Form
+$top.TopMost = $true
+$top.ShowInTaskbar = $false
+$top.FormBorderStyle = 'None'
+$top.StartPosition = 'CenterScreen'
+$top.Size = New-Object System.Drawing.Size(1, 1)
+$top.Opacity = 0
+$top.Show()
+$top.Activate()
+try {
+    $f = New-Object System.Windows.Forms.OpenFileDialog
+    $f.Title = 'Select Validator Executable'
+    $f.Filter = 'Executables (*.exe)|*.exe|All files (*.*)|*.*'
+    if ($f.ShowDialog($top) -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.WriteLine($f.FileName) }
+} finally { $top.Dispose() }
+"""
+
+def _run_picker_command(cmd, timeout=PICKER_TIMEOUT, **kwargs):
+    """Returns (launched, path); a cancelled dialog gives (True, '')."""
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, **kwargs)
+    except (FileNotFoundError, PermissionError):
+        return False, ""
+    except subprocess.TimeoutExpired:
+        return True, ""
+    out = [l.strip() for l in res.stdout.splitlines() if l.strip()]
+    return True, (out[-1] if out else "")
+
+def _run_windows_picker(script):
+    import tempfile
+    fd, ps_path = tempfile.mkstemp(suffix=".ps1", prefix="agent_pick_")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8-sig") as f:
+            f.write(script)
+        launched, path = _run_picker_command(
+            ["powershell.exe", "-Sta", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", ps_path],
+            creationflags=subprocess.CREATE_NO_WINDOW)
+        return launched, path
+    finally:
+        try:
+            os.remove(ps_path)
+        except OSError:
+            pass
+
+def _pick_tk(kind):
+    if is_frozen_app():
+        return False, ""
+    if kind == "folder":
+        call = "filedialog.askdirectory(title='Select Project Workspace Directory', parent=root)"
+    else:
+        call = "filedialog.askopenfilename(title='Select Validator Executable', parent=root)"
+    code = ("import tkinter as tk; from tkinter import filedialog; root = tk.Tk(); root.withdraw(); "
+            "root.wm_attributes('-topmost', 1); p = " + call + "; print(p or '')")
+    return _run_picker_command([sys.executable, "-c", code])
+
+def _pick_native(kind):
+    if sys.platform == "win32":
+        launched, path = _run_windows_picker(_PS_FOLDER_PICKER if kind == "folder" else _PS_FILE_PICKER)
+    elif sys.platform == "darwin":
+        what = "choose folder" if kind == "folder" else "choose file"
+        launched, path = _run_picker_command(["osascript", "-e", f'POSIX path of ({what})'])
+    else:
+        zen = ["zenity", "--file-selection", "--title=Select " + ("Project Workspace Directory" if kind == "folder" else "Validator Executable")]
+        if kind == "folder":
+            zen.insert(2, "--directory")
+        launched, path = _run_picker_command(zen)
+        if not launched:
+            launched, path = _run_picker_command(["kdialog", "--getexistingdirectory" if kind == "folder" else "--getopenfilename", os.path.expanduser("~")])
+    if not launched:
+        launched, path = _pick_tk(kind)
+    return path.replace("\\", "/") if path else ""
+
 def pick_folder_subprocess():
     with browse_lock:
-        if not is_frozen_app():
-            tk_code = (
-                "import tkinter as tk; from tkinter import filedialog; "
-                "root = tk.Tk(); root.withdraw(); "
-                "root.wm_attributes('-topmost', 1); "
-                "p = filedialog.askdirectory(title='Select Project Workspace Directory', parent=root); "
-                "print(p or '')"
-            )
-            try:
-                flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-                res = subprocess.run([sys.executable, "-c", tk_code], capture_output=True, text=True, timeout=45, creationflags=flags)
-                out = res.stdout.strip().splitlines()
-                if out and out[-1].strip():
-                    return out[-1].replace("\\", "/")
-            except Exception:
-                pass
-
-        if sys.platform != "win32":
-            try:
-                res = subprocess.run(["zenity", "--file-selection", "--directory", "--title=Select Project Workspace Directory"],
-                                     capture_output=True, text=True, timeout=45)
-                if res.returncode == 0 and res.stdout.strip():
-                    return res.stdout.strip()
-            except Exception:
-                pass
-
-        if sys.platform == "win32":
-            ps_code = (
-                "[System.Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms') | Out-Null; "
-                "$top = New-Object System.Windows.Forms.Form; "
-                "$top.TopMost = $true; "
-                "$top.Visible = $false; "
-                "$f = New-Object System.Windows.Forms.FolderBrowserDialog; "
-                "$f.Description = 'Select Project Workspace Directory'; "
-                "$f.ShowNewFolderButton = $true; "
-                "if ($f.ShowDialog($top) -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $f.SelectedPath }; "
-                "$top.Dispose()"
-            )
-            try:
-                res = subprocess.run(["powershell.exe", "-Sta", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", ps_code],
-                                     capture_output=True, text=True, timeout=45, creationflags=subprocess.CREATE_NO_WINDOW)
-                out = res.stdout.strip().splitlines()
-                if out and out[-1].strip():
-                    return out[-1].replace("\\", "/")
-            except Exception:
-                pass
-        return ""
+        return _pick_native("folder")
 
 def pick_file_subprocess():
     with browse_lock:
-        if not is_frozen_app():
-            tk_code = (
-                "import tkinter as tk; from tkinter import filedialog; "
-                "root = tk.Tk(); root.withdraw(); "
-                "root.wm_attributes('-topmost', 1); "
-                "p = filedialog.askopenfilename(title='Select Validator Executable (e.g. godot.exe, python.exe)', "
-                "filetypes=[('Executables', '*.exe;*'), ('All Files', '*.*')], parent=root); "
-                "print(p or '')"
-            )
-            try:
-                flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-                res = subprocess.run([sys.executable, "-c", tk_code], capture_output=True, text=True, timeout=45, creationflags=flags)
-                out = res.stdout.strip().splitlines()
-                if out and out[-1].strip():
-                    return out[-1].replace("\\", "/")
-            except Exception:
-                pass
-
-        if sys.platform != "win32":
-            try:
-                res = subprocess.run(["zenity", "--file-selection", "--title=Select Validator Executable"],
-                                     capture_output=True, text=True, timeout=45)
-                if res.returncode == 0 and res.stdout.strip():
-                    return res.stdout.strip()
-            except Exception:
-                pass
-
-        if sys.platform == "win32":
-            ps_code = (
-                "[System.Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms') | Out-Null; "
-                "$top = New-Object System.Windows.Forms.Form; "
-                "$top.TopMost = $true; "
-                "$top.Visible = $false; "
-                "$f = New-Object System.Windows.Forms.OpenFileDialog; "
-                "$f.Title = 'Select Validator Executable'; "
-                "$f.Filter = 'Executables (*.exe)|*.exe|All files (*.*)|*.*'; "
-                "if ($f.ShowDialog($top) -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $f.FileName }; "
-                "$top.Dispose()"
-            )
-            try:
-                res = subprocess.run(["powershell.exe", "-Sta", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", ps_code],
-                                     capture_output=True, text=True, timeout=45, creationflags=subprocess.CREATE_NO_WINDOW)
-                out = res.stdout.strip().splitlines()
-                if out and out[-1].strip():
-                    return out[-1].replace("\\", "/")
-            except Exception:
-                pass
-        return ""
+        return _pick_native("file")
 
 def get_project_files(proj_path, allowed_extensions=None):
     if not proj_path or not os.path.exists(proj_path):
@@ -1784,7 +1842,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
 <script>
   let isSettingsOpen = false;
   let toastTimeout = null;
-  let remoteUserscriptUrl = 'https://raw.githubusercontent.com/jonson-zero/ai-studio-agent/main/agent.user.js';
+  let remoteUserscriptUrl = 'https://github.com/jonson-zero/ai-studio-agent/releases/latest/download/agent.user.js';
 
   function parseSemver(verStr) {
     const cleaned = (verStr || '').replace(/^[vV]/, '').trim();
@@ -1937,7 +1995,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
     }
     const lbl = document.getElementById('lblCollapseAll');
     if (lbl) lbl.innerText = shouldCollapse ? 'Expand All' : 'Collapse All';
-    loadHistory();
+    loadHistory(true);
   }
 
   let currentUpdateInfo = null;
@@ -2156,12 +2214,17 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       if (activeTab === 'workspace') {
         const path = document.getElementById('modalProjectPath').value.trim();
         const bin = document.getElementById('modalValidatorBin').value.trim();
-        const res = await fetch('/api/set_config', {
+        const send = (create) => fetch('/api/set_config', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({path, validator_bin: bin})
+          body: JSON.stringify({path, validator_bin: bin, create})
         });
-        const data = await res.json().catch(() => ({}));
+        let res = await send(false);
+        let data = await res.json().catch(() => ({}));
+        if (!res.ok && data.code === 'missing_folder' && confirm(`Folder does not exist:\n${path}\n\nCreate it?`)) {
+          res = await send(true);
+          data = await res.json().catch(() => ({}));
+        }
         if (!res.ok) throw new Error(data.error || 'Failed to save config');
         showToast('Workspace settings saved');
       } else {
@@ -2198,7 +2261,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
     if (!confirm('Clear transaction history? Project files will not be affected.')) return;
     await fetch('/api/clear_history', {method: 'POST'});
     showToast('History cleared');
-    loadHistory();
+    loadHistory(true);
   }
 
   async function revertFile(transId, filePath) {
@@ -2214,7 +2277,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
     } else {
       showToast('Error: ' + (d.error || 'Failed to revert file'), true);
     }
-    loadHistory();
+    loadHistory(true);
   }
 
   async function revertTransaction(id, isolated = true) {
@@ -2238,7 +2301,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
     } else {
       showToast('Error: ' + (d.error || 'Failed to revert'), true);
     }
-    loadHistory();
+    loadHistory(true);
   }
 
   function renderDiff(diffText) {
@@ -2335,8 +2398,16 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
     }
   }
 
-  async function loadHistory() {
+  let lastHistorySig = null;
+
+  async function loadHistory(force = false) {
     try {
+      const sigRes = await fetch('/api/history_sig');
+      if (sigRes.ok) {
+        const sigData = await sigRes.json();
+        if (!force && sigData.sig === lastHistorySig) return;
+        lastHistorySig = sigData.sig;
+      }
       const res = await fetch('/api/history');
       if (!res.ok) return;
       const transactions = await res.json();
@@ -2418,7 +2489,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       if (document.getElementById('settingsModal').style.display === 'flex') closeSettings();
       if (document.getElementById('updateModal').style.display === 'flex') document.getElementById('updateModal').style.display = 'none';
     }
-    if (e.key === 'Enter' && isSettingsOpen && e.target && e.target.tagName === 'INPUT' && e.target.type === 'text') {
+    if (e.key === 'Enter' && isSettingsOpen && e.target && (e.target.id === 'modalProjectPath' || e.target.id === 'modalValidatorBin')) {
       saveActiveModal();
     }
   });
@@ -2483,8 +2554,8 @@ class AgentBridgeHandler(http.server.BaseHTTPRequestHandler):
             return
 
         if path in ["/agent.user.js", "/AI-Studio-Agent.user.js"]:
-            local_script = os.path.join(get_app_dir(), "agent.user.js")
-            if os.path.exists(local_script):
+            local_script = find_local_userscript()
+            if local_script:
                 try:
                     with open(local_script, "rb") as f:
                         content = f.read()
@@ -2542,6 +2613,15 @@ class AgentBridgeHandler(http.server.BaseHTTPRequestHandler):
                 hist_copy = load_workspace_history(proj)
             self._set_headers(200)
             self.wfile.write(json.dumps(hist_copy).encode('utf-8'))
+
+        elif path == "/api/history_sig":
+            import hashlib
+            with state_lock:
+                proj = config.get("project_path", "")
+                hist_copy = load_workspace_history(proj)
+            sig = hashlib.sha1(json.dumps(hist_copy, sort_keys=True).encode('utf-8')).hexdigest()
+            self._set_headers(200)
+            self.wfile.write(json.dumps({"sig": sig, "count": len(hist_copy)}).encode('utf-8'))
 
         elif path == "/api/system_instruction":
             with state_lock:
@@ -2742,9 +2822,16 @@ class AgentBridgeHandler(http.server.BaseHTTPRequestHandler):
                         if new_p:
                             norm_p = os.path.normpath(new_p).replace("\\", "/")
                             if not os.path.isdir(norm_p):
-                                self._set_headers(400)
-                                self.wfile.write(b'{"error":"Project folder does not exist"}')
-                                return
+                                if not req.get("create"):
+                                    self._set_headers(400)
+                                    self.wfile.write(b'{"error":"Project folder does not exist","code":"missing_folder"}')
+                                    return
+                                try:
+                                    os.makedirs(norm_p, exist_ok=True)
+                                except OSError as e:
+                                    self._set_headers(400)
+                                    self.wfile.write(json.dumps({"error": f"Cannot create folder: {e}"}).encode('utf-8'))
+                                    return
                             config["project_path"] = norm_p
                             add_recent_project(norm_p)
                         else:
@@ -3301,19 +3388,25 @@ def create_server(target_port):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=f"{APP_DISPLAY_NAME} Server")
-    parser.add_argument("--port", type=int, help="Override server port")
+    parser.add_argument("--port", type=int, help="Server port for this run (the userscript must use the same port)")
     parser.add_argument("--project", type=str, help="Override workspace project path")
     parser.add_argument("--preset", type=str, help="Override active preset (e.g. godot4, default)")
     args = parser.parse_args()
 
     preferred_port = args.port or config.get("port", DEFAULT_PORT)
     if args.project:
-        config["project_path"] = args.project
+        if os.path.isdir(args.project):
+            config["project_path"] = os.path.normpath(args.project).replace("\\", "/")
+        else:
+            print(f"[WARN] --project '{args.project}' is not an existing folder; ignoring.")
+    if args.preset:
+        if args.preset in load_all_presets():
+            config["active_preset"] = args.preset
+        else:
+            print(f"[WARN] --preset '{args.preset}' not found (available: {', '.join(sorted(load_all_presets()))}); ignoring.")
     if config.get("project_path"):
         add_recent_project(config["project_path"])
-        save_config(config)
-    if args.preset:
-        config["active_preset"] = args.preset
+    save_config(config)
 
     server, ACTIVE_PORT = create_server(preferred_port)
 
