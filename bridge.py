@@ -859,16 +859,26 @@ def apply_range_patch(old_content, anchor_start, anchor_end, new_content):
             if all(i + j < len(old_lines) and old_lines[i + j].strip() == end_lines[j] for j in range(len(end_lines))):
                 matches.append(i)
 
+    orig_first = old_lines[start_idx]
+    orig_indent = orig_first[:len(orig_first) - len(orig_first.lstrip())]
+
     if not matches:
         if anchor_start.strip() == anchor_end.strip():
             end_idx = start_idx + len(start_lines)
         else:
             return old_content, False, f"anchor_end '{end_lines[0][:50]}' not found after line {start_idx + 1}."
     else:
-        end_idx = matches[0] + len(end_lines)
+        # the block end sits at the start line's indentation
+        same_indent = [m for m in matches if old_lines[m][:len(old_lines[m]) - len(old_lines[m].lstrip())] == orig_indent]
+        if same_indent:
+            chosen = same_indent[0]
+        elif len(matches) == 1:
+            chosen = matches[0]
+        else:
+            return old_content, False, (f"Ambiguous anchor_end '{end_lines[0][:50]}' found in {len(matches)} locations "
+                                        f"(lines: {[m + 1 for m in matches]}) after line {start_idx + 1}. Add more anchor lines.")
+        end_idx = chosen + len(end_lines)
 
-    orig_first = old_lines[start_idx]
-    orig_indent = orig_first[:len(orig_first) - len(orig_first.lstrip())]
     dedented = textwrap.dedent(new_content)
     aligned_content = textwrap.indent(dedented, orig_indent, predicate=lambda l: bool(l.strip())).splitlines()
     content_lines = aligned_content
@@ -1034,6 +1044,38 @@ def apply_patch_smart(old_content, search_block, replace_block):
 
     return old_content, False, "\n".join(diag_lines)
 
+def compute_change(act, cur_c, item):
+    """Returns (new_content, ok, diagnostic)."""
+    cnt = normalize_newlines(item.get("content") or "")
+    if act == "patch":
+        if not cnt:
+            return cur_c, False, "Patch rejected because 'content' is missing or empty."
+        if cur_c is None:
+            return cur_c, False, "File does not exist to patch."
+        a_start = normalize_newlines(item.get("anchor_start") or "")
+        a_end = normalize_newlines(item.get("anchor_end") or "")
+        if a_start and a_end:
+            return apply_range_patch(cur_c, a_start, a_end, cnt)
+        return apply_patch_smart(cur_c, normalize_newlines(item.get("search") or ""), cnt)
+    if act == "append":
+        if not cnt:
+            return cur_c, False, "Append rejected because 'content' is missing or empty."
+        base = cur_c or ""
+        if base and not base.endswith("\n"):
+            base += "\n"
+        return base + cnt + "\n", True, "Appended"
+    if not cnt and cur_c:
+        return cur_c, False, "Overwrite with empty 'content' would erase an existing non-empty file. Use action 'delete' if that is intended."
+    return cnt, True, "Overwritten"
+
+def make_diff(rel_path, old, new):
+    old_l = old.splitlines(keepends=True) if old else []
+    new_l = new.splitlines(keepends=True) if new else []
+    diff = "".join(difflib.unified_diff(old_l, new_l, fromfile=f"a/{rel_path}", tofile=f"b/{rel_path}"))
+    adds = sum(1 for l in diff.splitlines() if l.startswith('+') and not l.startswith('+++'))
+    dels = sum(1 for l in diff.splitlines() if l.startswith('-') and not l.startswith('---'))
+    return diff, adds, dels
+
 def simulate_changes_batch(proj, changes, confirm_delete):
     sim_files = {}
     seen_ranges = []
@@ -1059,10 +1101,6 @@ def simulate_changes_batch(proj, changes, confirm_delete):
         act = (item.get("action") or "").lower()
         if act not in VALID_ACTIONS:
             return False, [f"{rel_p} (change #{idx+1}): Unknown or missing action '{item.get('action')}'. Allowed: {sorted(VALID_ACTIONS)}."]
-        cnt = normalize_newlines(item.get("content") or "")
-        srch = normalize_newlines(item.get("search") or "")
-        a_start = normalize_newlines(item.get("anchor_start") or "")
-        a_end = normalize_newlines(item.get("anchor_end") or "")
         full_p = os.path.join(proj, rel_p)
 
         if act == "mkdir":
@@ -1089,26 +1127,11 @@ def simulate_changes_batch(proj, changes, confirm_delete):
             if not item.get("confirmed", False) and not confirm_delete:
                 return False, [f"{rel_p}: Deletion blocked (explicit user confirmation required)."]
             sim_files[rel_p] = None
-        elif act == "patch":
-            if not cnt:
-                return False, [f"{rel_p} (change #{idx+1}): Patch rejected because 'content' is missing or empty."]
-            if cur_c is None:
-                return False, [f"{rel_p} (change #{idx+1}): File does not exist to patch."]
-            if a_start and a_end:
-                new_c, ok, diag = apply_range_patch(cur_c, a_start, a_end, cnt)
-            else:
-                new_c, ok, diag = apply_patch_smart(cur_c, srch, cnt)
+        else:
+            new_c, ok, diag = compute_change(act, cur_c, item)
             if not ok:
                 return False, [f"{rel_p} (change #{idx+1}): {diag}"]
             sim_files[rel_p] = new_c
-        elif act == "append":
-            if not cnt:
-                return False, [f"{rel_p} (change #{idx+1}): Append rejected because 'content' is missing or empty."]
-            sim_files[rel_p] = (cur_c + "\n" if cur_c else "") + cnt + "\n"
-        else:  # overwrite
-            if not cnt and cur_c:
-                return False, [f"{rel_p} (change #{idx+1}): Overwrite with empty 'content' would erase an existing non-empty file. Use action 'delete' if that is intended."]
-            sim_files[rel_p] = cnt
 
     return True, []
 
@@ -3006,53 +3029,44 @@ class AgentBridgeHandler(http.server.BaseHTTPRequestHandler):
                 simulated_files = {}
                 for item in changes:
                     rel_p = clean_rel_path(item.get("file_path", ""))
-                    if not rel_p or not is_safe_path(proj, rel_p):
+                    if not rel_p or not is_safe_path(proj, rel_p) or is_protected_path(rel_p):
                         continue
+                    act = (item.get("action") or "").lower()
+                    comment = item.get("comment", "")
+                    if act not in VALID_ACTIONS:
+                        preview_files.append({"file_path": rel_p, "action": act, "comment": comment, "additions": 0, "deletions": 0,
+                                              "diff": f"# ERROR: unknown or missing action '{item.get('action')}'\n", "error": "Unknown action"})
+                        continue
+                    if act == "mkdir":
+                        preview_files.append({"file_path": rel_p, "action": act, "additions": 0, "deletions": 0, "diff": f"# Directory: {rel_p}\n"})
+                        continue
+
                     full_p = os.path.join(proj, rel_p)
                     if rel_p not in simulated_files:
                         old_c = None
-                        if os.path.exists(full_p):
-                            with open(full_p, "r", encoding="utf-8", errors="replace") as f:
-                                old_c = normalize_newlines(f.read())
+                        if os.path.isfile(full_p):
+                            try:
+                                old_c, _ = read_text_exact(full_p)
+                            except (NonUtf8Error, OSError) as e:
+                                preview_files.append({"file_path": rel_p, "action": act, "comment": comment, "additions": 0, "deletions": 0,
+                                                      "diff": f"# ERROR: {e}\n", "error": str(e)})
+                                continue
                         simulated_files[rel_p] = old_c
-
                     cur_c = simulated_files[rel_p]
-                    act = item.get("action", "overwrite").lower()
-                    cnt = normalize_newlines(item.get("content", ""))
-                    srch = normalize_newlines(item.get("search", ""))
-                    a_start = normalize_newlines(item.get("anchor_start", ""))
-                    a_end = normalize_newlines(item.get("anchor_end", ""))
-                    new_c = cur_c
 
-                    if act == "mkdir":
-                        preview_files.append({"file_path": rel_p, "additions": 0, "deletions": 0, "diff": f"# Directory: {rel_p}\n"})
-                        continue
-                    elif act == "delete":
-                        old_lines = cur_c.splitlines(keepends=True) if cur_c else []
-                        d_str = "".join(difflib.unified_diff(old_lines, [], fromfile=f"a/{rel_p}", tofile="/dev/null"))
-                        preview_files.append({"file_path": rel_p, "additions": 0, "deletions": len(old_lines), "diff": d_str})
+                    if act == "delete":
+                        diff, adds, dels = make_diff(rel_p, cur_c, "")
+                        preview_files.append({"file_path": rel_p, "action": act, "comment": comment, "additions": 0, "deletions": dels, "diff": diff.replace(f"b/{rel_p}", "/dev/null")})
                         simulated_files[rel_p] = None
                         continue
-                    elif act == "patch":
-                        if cur_c is None:
-                            continue
-                        if a_start and a_end:
-                            new_c, ok, _ = apply_range_patch(cur_c, a_start, a_end, cnt)
-                        else:
-                            new_c, ok, _ = apply_patch_smart(cur_c, srch, cnt)
-                        if not ok:
-                            new_c = cur_c
-                    elif act == "append":
-                        new_c = (cur_c + "\n" if cur_c else "") + cnt + "\n"
-                    else:
-                        new_c = cnt
 
-                    old_l = cur_c.splitlines(keepends=True) if cur_c else []
-                    new_l = new_c.splitlines(keepends=True) if new_c else []
-                    d_str = "".join(difflib.unified_diff(old_l, new_l, fromfile=f"a/{rel_p}", tofile=f"b/{rel_p}"))
-                    adds = sum(1 for l in d_str.splitlines() if l.startswith('+') and not l.startswith('+++'))
-                    dels = sum(1 for l in d_str.splitlines() if l.startswith('-') and not l.startswith('---'))
-                    preview_files.append({"file_path": rel_p, "action": act, "comment": item.get("comment", ""), "additions": adds, "deletions": dels, "diff": d_str})
+                    new_c, ok, diag = compute_change(act, cur_c, item)
+                    if not ok:
+                        preview_files.append({"file_path": rel_p, "action": act, "comment": comment, "additions": 0, "deletions": 0,
+                                              "diff": f"# ERROR: {diag}\n", "error": diag})
+                        continue
+                    diff, adds, dels = make_diff(rel_p, cur_c, new_c)
+                    preview_files.append({"file_path": rel_p, "action": act, "comment": comment, "additions": adds, "deletions": dels, "diff": diff})
                     simulated_files[rel_p] = new_c
 
                 self._set_headers(200)
@@ -3160,10 +3174,6 @@ class AgentBridgeHandler(http.server.BaseHTTPRequestHandler):
                 for item in changes:
                     action = (item.get("action") or "overwrite").lower()
                     rel_path = clean_rel_path(item.get("file_path", ""))
-                    content = normalize_newlines(item.get("content", ""))
-                    search = normalize_newlines(item.get("search", ""))
-                    anchor_start = normalize_newlines(item.get("anchor_start", ""))
-                    anchor_end = normalize_newlines(item.get("anchor_end", ""))
                     comment = item.get("comment", "")
 
                     if not rel_path:
@@ -3250,33 +3260,13 @@ class AgentBridgeHandler(http.server.BaseHTTPRequestHandler):
                         print(f"[APPLY] [DELETE] {rel_path} ({comment})")
                         continue
 
-                    new_content = ""
-                    if action == "patch":
-                        if not content:
-                            errors.append(f"{rel_path}: Patch rejected because 'content' is missing or empty.")
-                            continue
-                        if old_content is None:
-                            errors.append(f"{rel_path}: File does not exist to patch")
-                            continue
-                        if anchor_start and anchor_end:
-                            new_content, success, diag = apply_range_patch(old_content, anchor_start, anchor_end, content)
-                        else:
-                            new_content, success, diag = apply_patch_smart(old_content, search, content)
-                        if not success:
-                            print(f"[FAIL] Target patch failed in {rel_path}: {diag}")
-                            errors.append(f"{rel_path}: {diag}")
-                            continue
-                    elif action == "append":
-                        new_content = (old_content + "\n" if old_content else "") + content + "\n"
-                    else:
-                        new_content = content
+                    new_content, success, diag = compute_change(action, old_content, item)
+                    if not success:
+                        print(f"[FAIL] Change failed in {rel_path}: {diag}")
+                        errors.append(f"{rel_path}: {diag}")
+                        continue
 
-                    old_lines = old_content.splitlines(keepends=True) if old_content else []
-                    new_lines = new_content.splitlines(keepends=True)
-                    diff = "".join(difflib.unified_diff(old_lines, new_lines, fromfile=f"a/{rel_path}", tofile=f"b/{rel_path}"))
-
-                    additions = sum(1 for l in diff.splitlines() if l.startswith('+') and not l.startswith('+++'))
-                    deletions = sum(1 for l in diff.splitlines() if l.startswith('-') and not l.startswith('---'))
+                    diff, additions, deletions = make_diff(rel_path, old_content, new_content)
 
                     total_additions += additions
                     total_deletions += deletions
