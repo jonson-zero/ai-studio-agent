@@ -1694,7 +1694,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
   <div class="header-left">
     <div class="brand">
       <span class="brand-title">AI Studio Agent</span>
-      <span class="version-tag" id="lblVersionTag">v1.0</span>
+      <span class="version-tag" id="lblVersionTag"></span>
       <div id="badgeUpdate" class="badge-update" style="display:none;" onclick="showUpdateModal()">
         <span>Update available: <strong id="lblLatestVer"></strong></span>
       </div>
@@ -2377,6 +2377,7 @@ HTML_DASHBOARD = r"""<!DOCTYPE html>
       currentActivePresetId = data.active_preset.id;
       if (data.userscript_url) remoteUserscriptUrl = data.userscript_url;
       document.getElementById('lblStoragePath').innerText = data.storage_dir;
+      document.getElementById('lblVersionTag').innerText = 'v' + data.version;
       
       populatePresetDropdowns(data.active_preset.id);
       updateRecentWorkspacesDropdown(data.recent_projects, data.project_path);
