@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AI Studio Agent
 // @namespace    http://tampermonkey.net/
-// @version      1.0.1
+// @version      1.1
 // @description  Zero-API-cost Local Coding Agent
 // @updateURL    https://github.com/jonson-zero/ai-studio-agent/releases/latest/download/agent.user.js
 // @downloadURL  https://github.com/jonson-zero/ai-studio-agent/releases/latest/download/agent.user.js
@@ -24,10 +24,11 @@
     }
 
     const SERVICE_NAME = "ai-studio-agent";
-    const SCRIPT_VERSION = "1.0.1";
+    const SCRIPT_VERSION = "1.1";
     const MAX_AUTO_INSPECT = 4;
     const MAX_PATCH_RETRIES = 2;
     let patchRetryCount = 0;
+    let jsonRetryCount = 0;
     let needsUserscriptUpdate = false;
     let bridgeRequiredScriptVer = "1.0";
     let hasWarnedScriptOutdated = false;
@@ -52,7 +53,7 @@
         return `${cleanPath}::${activePresetInfo.id || 'default'}`;
     }
 
-    let lastAppliedSignature = GM_getValue('last_applied_signature', null);
+    let lastAppliedSignature = null;
     let lastAutoProcessedSignature = null;
     let lastProcessedChangesSig = null;
     let lastHandledErrorSig = null;
@@ -70,6 +71,8 @@
     let isQueued = false;
     let isOperationInProgress = false;
     let currentToastTimer = null;
+    let currentToastRemoveTimer = null;
+    let renderEpoch = 0;
 
     let lastModelTextLength = 0;
     let textStableCounter = 0;
@@ -117,6 +120,7 @@
     function showToast(msg, isError = false) {
         let toast = document.getElementById('studio-agent-toast');
         if (currentToastTimer) clearTimeout(currentToastTimer);
+        if (currentToastRemoveTimer) clearTimeout(currentToastRemoveTimer);
 
         if (!toast) {
             toast = createEl('div', {
@@ -150,7 +154,7 @@
             if (toast) {
                 toast.style.opacity = '0';
                 toast.style.transform = 'translateY(4px)';
-                setTimeout(() => { if (toast && toast.parentNode) toast.remove(); }, 200);
+                currentToastRemoveTimer = setTimeout(() => { if (toast && toast.parentNode) toast.remove(); }, 200);
             }
         }, 3000);
     }
@@ -241,9 +245,9 @@
 
     function detectRepetitionLoop(text) {
         if (!text || text.length < 120) return false;
-        const tail = text.slice(-450);
-        const loopRegex = /(.{10,80}?)\1{3,}/s;
-        return loopRegex.test(tail);
+        const tail = text.slice(-450).replace(/\s+/g, ' ');
+        const m = /(.{12,80}?)\1{3,}/.exec(tail);
+        return Boolean(m && /[A-Za-z0-9_]{4,}/.test(m[1]));
     }
 
     async function insertTextToPrompt(text) {
@@ -311,29 +315,6 @@
         return true;
     }
 
-    function triggerRunPrompt() {
-        const inputArea = getPromptInputArea();
-        if (inputArea) {
-            inputArea.focus();
-            const enterEvt = new KeyboardEvent('keydown', {
-                bubbles: true,
-                cancelable: true,
-                key: 'Enter',
-                code: 'Enter',
-                keyCode: 13,
-                which: 13,
-                ctrlKey: true
-            });
-            inputArea.dispatchEvent(enterEvt);
-        }
-
-        setTimeout(() => {
-            if (isAiGenerating()) return;
-            const runBtn = findRunButton();
-            if (runBtn && !runBtn.disabled) runBtn.click();
-        }, 250);
-    }
-
     async function submitPrompt(text) {
         if (!text || !text.trim()) return false;
 
@@ -391,8 +372,7 @@
         if (!raw) return '';
         let s = raw.trim();
 
-        // 0. Clean broken unicode sequences and control characters
-        s = s.replace(/\\u(?![0-9a-fA-F]{4})/g, 'u');
+        // 0. Strip control characters
         s = s.replace(/[\uFFFD\u0000-\u0008\u000B-\u000C\u000E-\u001F]/g, '');
 
         // 1. Strip markdown fences if present
@@ -418,7 +398,7 @@
                         i += 5;
                         continue;
                     } else {
-                        result += next;
+                        result += '\\\\' + next;
                         i++;
                         continue;
                     }
@@ -455,12 +435,15 @@
                     result += '"';
                     continue;
                 }
+                if (ch === ',') {
+                    let k = i + 1;
+                    while (k < len && /\s/.test(s[k])) k++;
+                    if (s[k] === '}' || s[k] === ']') continue;
+                }
                 result += ch;
             }
         }
 
-        // 3. Remove trailing commas before closing braces or brackets
-        result = result.replace(/,\s*([}\]])/g, '$1');
         return result;
     }
 
@@ -551,7 +534,11 @@
     function parseJsonFromText(rawText) {
         if (!rawText) return null;
         let text = rawText.trim();
-        text = text.replace(/^\s*\d+\s*[|│]?\s*/gm, '');
+        const nonEmpty = text.split('\n').filter(l => l.trim());
+        const numbered = nonEmpty.filter(l => /^\s*\d+\s*[|│]?(\s|$)/.test(l)).length;
+        if (nonEmpty.length >= 2 && numbered / nonEmpty.length >= 0.8) {
+            text = text.replace(/^\s*\d+\s*[|│]?\s*/gm, '');
+        }
 
         const candidates = [];
 
@@ -1345,6 +1332,11 @@
         return card;
     }
 
+    function refreshCards() {
+        renderEpoch++;
+        renderInChatMessageCards();
+    }
+
     function renderInChatMessageCards() {
         const turnSelector = 'ms-chat-turn, ms-model-turn, .chat-turn, .model-turn, [data-turn-role]';
         document.querySelectorAll(turnSelector).forEach(turn => {
@@ -1357,10 +1349,11 @@
         const turns = Array.from(document.querySelectorAll(turnSelector)).filter(t => isModelTurn(t));
 
         turns.forEach(turn => {
+            const rawLen = String((turn.textContent || '').length);
+            if (turn.dataset.cachedRaw === rawLen && turn.dataset.cachedEpoch === String(renderEpoch)) return;
+            turn.dataset.cachedRaw = rawLen;
+            turn.dataset.cachedEpoch = String(renderEpoch);
             const text = getTurnRawText(turn);
-            const cachedCard = turn.querySelector('.studio-agent-message-card');
-            if (cachedCard && turn.dataset.cachedLen === String(text.length)) return;
-            turn.dataset.cachedLen = String(text.length);
             if (!text.includes('message_to_user')) {
                 const oldCard = turn.querySelector('.studio-agent-message-card');
                 if (oldCard) oldCard.remove();
@@ -1401,7 +1394,7 @@
                                 const d = JSON.parse(r.responseText);
                                 if (d && Array.isArray(d.files) && d.files.length > 0) {
                                     appliedTransactions[previewCacheKey] = { files: d.files };
-                                    renderInChatMessageCards();
+                                    refreshCards();
                                 }
                             } catch (e) {}
                         }
@@ -1517,16 +1510,27 @@
         if (!payload || isOperationInProgress) return;
 
         const signature = getChangesSignature(payload.changes);
-        if (appliedSignatures.has(signature) || signature === lastAppliedSignature || (isAuto && signature === lastProcessedChangesSig)) {
-            if (!isAuto) showToast('Changes already applied', false);
-            return;
-        }
+        const alreadyApplied = appliedSignatures.has(signature) || signature === lastAppliedSignature;
+        if (isAuto && (alreadyApplied || signature === lastProcessedChangesSig)) return;
+        if (!isAuto && alreadyApplied && !window.confirm('These exact changes were already applied in this session. Apply them again?')) return;
         lastProcessedChangesSig = signature;
+
+        const outChanges = (payload.changes || []).map(c => {
+            const copy = { ...c };
+            delete copy.confirmed;
+            return copy;
+        });
+        const outPayload = {
+            thought: payload.thought,
+            message_to_user: payload.message_to_user,
+            inspect_files: payload.inspect_files,
+            changes: outChanges
+        };
 
         isOperationInProgress = true;
         updateApplyButtonUI();
 
-        const deleteActions = (payload.changes || []).filter(c => (c.action || '').toLowerCase() === 'delete');
+        const deleteActions = outChanges.filter(c => (c.action || '').toLowerCase() === 'delete');
         if (deleteActions.length > 0) {
             const fileList = deleteActions.map(c => `• ${c.file_path}`).join('\n');
             const ok = window.confirm(`CONFIRM FILE DELETION\n\nThe Agent requested to DELETE the following file(s):\n\n${fileList}\n\nAre you sure you want to delete these files?`);
@@ -1545,12 +1549,12 @@
                 method: 'POST',
                 url: `${getServerUrl()}/api/apply_changes`,
                 headers: { 'Content-Type': 'application/json' },
-                data: JSON.stringify(payload),
-                timeout: 15000,
+                data: JSON.stringify(outPayload),
+                timeout: 120000,
                 ontimeout: () => {
                     isOperationInProgress = false;
                     updateApplyButtonUI();
-                    showToast('Request timed out (15s)', true);
+                    showToast('Request timed out. The bridge may still have applied the changes: check the dashboard before retrying', true);
                     resolve();
                 },
                 onload: (res) => {
@@ -1579,14 +1583,13 @@
 
                             if (cardStatus !== 'failed') {
                                 lastAppliedSignature = signature;
-                                GM_setValue('last_applied_signature', signature);
                                 appliedSignatures.add(signature);
                                 if (d.transaction) {
                                     appliedTransactions[signature] = d.transaction;
                                 }
                             }
 
-                            renderInChatMessageCards();
+                            refreshCards();
                             if (hasErrors) {
                                 console.error('[Agent Bridge Errors]', d.errors);
                                 showToast(`Error: ${d.errors[0]}`, true);
@@ -1594,13 +1597,11 @@
                                     patchRetryCount++;
                                     showToast(`Patch error. Requesting Agent self-repair (${patchRetryCount}/${MAX_PATCH_RETRIES})...`);
                                     const recoveryPrompt = `[TOOL RESULT: Patch Application Error]\n` +
-                                        `The bridge server rejected your patch with error:\n` +
+                                        `The bridge server rejected your changes with error:\n` +
                                         `${d.errors.join('\n')}\n\n` +
-                                        `STRICT CORRECTION INSTRUCTIONS:\n` +
-                                        `1. Your previous 'search' block was REJECTED because it was too large or failed to match.\n` +
-                                        `2. Provide a MICRO-PATCH: 'search' MUST be ONLY 2 to 5 lines of verbatim code.\n` +
-                                        `3. Or use 'anchor_start' (1-2 lines) and 'anchor_end' (1-2 lines).\n` +
-                                        `4. NEVER include whole functions. Split into multiple items in 'changes' if needed.`;
+                                        `Fix the problem described above and resend the corrected 'changes'.\n` +
+                                        `If a 'search' or anchor failed to match or was ambiguous, use a short unique block of 2-6 verbatim lines ` +
+                                        `(or 'anchor_start'/'anchor_end'), and request the file via 'inspect_files' if you are unsure of its current content.`;
                                     submitPrompt(recoveryPrompt).then(ok => {
                                         if (ok) showToast(`Self-repair prompt sent (${patchRetryCount}/${MAX_PATCH_RETRIES})`);
                                     });
@@ -1628,7 +1629,7 @@
                             warnings: [],
                             updated: []
                         };
-                        renderInChatMessageCards();
+                        refreshCards();
                         showToast('Failed to apply file changes', true);
                     }
                     resolve();
@@ -1643,7 +1644,7 @@
                         warnings: [],
                         updated: []
                     };
-                    renderInChatMessageCards();
+                    refreshCards();
                     showToast(`Server offline on port ${currentPort}`, true);
                     resolve();
                 }
@@ -1675,11 +1676,11 @@
             if (errSig === lastHandledErrorSig && isAuto) return;
             lastHandledErrorSig = errSig;
             showToast('JSON Syntax Error: failed to parse changes', true);
-            if (isAgentActive && patchRetryCount < MAX_PATCH_RETRIES) {
-                patchRetryCount++;
+            if (isAgentActive && jsonRetryCount < MAX_PATCH_RETRIES) {
+                jsonRetryCount++;
                 isOperationInProgress = true;
                 updateApplyButtonUI();
-                showToast(`Requesting JSON repair (${patchRetryCount}/${MAX_PATCH_RETRIES})...`);
+                showToast(`Requesting JSON repair (${jsonRetryCount}/${MAX_PATCH_RETRIES})...`);
                 
                 let diagnostic = `[TOOL RESULT: JSON Syntax Error]\n` +
                     `Your previous output could not be parsed as valid JSON.\n` +
@@ -1702,11 +1703,12 @@
                     isOperationInProgress = false;
                     updateApplyButtonUI();
                 }
-            } else if (patchRetryCount >= MAX_PATCH_RETRIES) {
+            } else if (jsonRetryCount >= MAX_PATCH_RETRIES) {
                 showToast('JSON repair aborted: check DevTools console (F12) for details', true);
             }
             return;
         }
+        jsonRetryCount = 0;
 
         if (payload.inspect_files && payload.inspect_files.length > 0) {
             await handleAutoInspect(payload.inspect_files);
@@ -1733,7 +1735,12 @@
         const curText = lastTurn ? (lastTurn.textContent || '') : '';
         const curLen = curText.length;
 
-        if (generating && detectRepetitionLoop(curText)) {
+        let loopText = '';
+        if (generating) {
+            const modelTurns = Array.from(turns).filter(t => isModelTurn(t));
+            loopText = modelTurns.length ? getTurnRawText(modelTurns[modelTurns.length - 1]) : '';
+        }
+        if (generating && detectRepetitionLoop(loopText)) {
             const stopBtn = findStopButton();
             if (stopBtn) {
                 stopBtn.click();
@@ -1852,7 +1859,7 @@
             url: `${getServerUrl()}/api/files`,
             onload: (res) => {
                 if (res.status !== 200) return;
-                allFiles = JSON.parse(res.responseText);
+                try { allFiles = JSON.parse(res.responseText); } catch (e) { return; }
 
                 function render(list) {
                     safeClear(fileListContainer);
@@ -1897,7 +1904,8 @@
                         onerror: () => r({content: '[Error loading file]'})
                     });
                 });
-                combined += `# === File: ${file} ===\n\`\`\`\n${res.content}\n\`\`\`\n\n`;
+                const fileText = typeof res.content === 'string' ? res.content : `[${res.error || 'cannot read file'}]`;
+                combined += `# === File: ${file} ===\n\`\`\`\n${fileText}\n\`\`\`\n\n`;
             }
             insertTextToPrompt(combined);
             overlay.remove();
@@ -2103,10 +2111,18 @@
                     GM_xmlhttpRequest({
                         method: 'GET',
                         url: `${getServerUrl()}/api/system_instruction`,
-                        onload: (r) => resolve(JSON.parse(r.responseText)),
-                        onerror: reject
+                        timeout: 8000,
+                        onload: (r) => {
+                            try {
+                                if (r.status !== 200) throw new Error(`HTTP ${r.status}`);
+                                resolve(JSON.parse(r.responseText));
+                            } catch (e) { reject(e); }
+                        },
+                        onerror: reject,
+                        ontimeout: () => reject(new Error('timeout'))
                     });
                 });
+                if (typeof res.system_instruction !== 'string') throw new Error('Invalid system instruction response');
 
                 const sysInstruction = res.system_instruction || '';
                 const schemaString = JSON.stringify(res.schema || {}, null, 2);
@@ -2192,8 +2208,8 @@
             hasMoved = false;
             pos3 = e.clientX;
             pos4 = e.clientY;
-            document.onmouseup = closeDragElement;
-            document.onmousemove = elementDrag;
+            document.addEventListener('mouseup', closeDragElement);
+            document.addEventListener('mousemove', elementDrag);
         }
 
         function elementDrag(e) {
@@ -2221,8 +2237,8 @@
         }
 
         function closeDragElement() {
-            document.onmouseup = null;
-            document.onmousemove = null;
+            document.removeEventListener('mouseup', closeDragElement);
+            document.removeEventListener('mousemove', elementDrag);
             if (hasMoved) {
                 GM_setValue('toolbar_pos', { top: element.style.top, left: element.style.left });
             } else if (onClickOnly) {
@@ -2264,6 +2280,13 @@
             toolbar.style.left = savedPos.left;
             toolbar.style.bottom = 'auto';
             toolbar.style.right = 'auto';
+            requestAnimationFrame(() => {
+                const r = toolbar.getBoundingClientRect();
+                if (r.right > window.innerWidth || r.bottom > window.innerHeight || r.left < 0 || r.top < 0) {
+                    toolbar.style.top = Math.max(10, Math.min(window.innerHeight - r.height - 10, r.top)) + 'px';
+                    toolbar.style.left = Math.max(10, Math.min(window.innerWidth - r.width - 10, r.left)) + 'px';
+                }
+            });
         }
 
         if (isCollapsed) {
@@ -2310,10 +2333,13 @@
         statusDot.title = isServerOnline ? `Online (Port :${currentPort})` : 'Offline (Click to change port)';
         statusDot.onclick = () => {
             const p = prompt("Enter Bridge Server Port:", currentPort);
-            if (p && !isNaN(p)) {
-                currentPort = parseInt(p, 10);
+            const port = parseInt(p, 10);
+            if (Number.isInteger(port) && port >= 1 && port <= 65535) {
+                currentPort = port;
                 GM_setValue('bridge_port', currentPort);
                 manualReconnect();
+            } else if (p) {
+                showToast('Invalid port (1-65535)', true);
             }
         };
         toolbar.appendChild(statusDot);
@@ -2534,7 +2560,7 @@
         GM_xmlhttpRequest({
             method: 'GET',
             url: `${getServerUrl()}/api/status?client_ver=${encodeURIComponent(SCRIPT_VERSION)}`,
-            timeout: 800,
+            timeout: 2500,
             onload: res => {
                 if (res.status === 200) {
                     try {
@@ -2542,6 +2568,7 @@
                         if (d.service === SERVICE_NAME) {
                             const prevOnline = isServerOnline;
                             isServerOnline = true;
+                            if (!prevOnline) renderEpoch++;
                             failedAttempts = 0;
                             let needsRender = !prevOnline;
 

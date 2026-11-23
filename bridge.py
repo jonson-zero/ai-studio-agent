@@ -21,7 +21,7 @@ import re
 DEFAULT_PORT = 9099
 SERVICE_NAME = "ai-studio-agent"
 APP_DISPLAY_NAME = "AI Studio Agent"
-VERSION = "1.0.1"
+VERSION = "1.1"
 MIN_USERSCRIPT_VERSION = "1.0"
 OFFICIAL_REPO = "jonson-zero/ai-studio-agent"
 last_known_script_ver = ""
@@ -748,7 +748,7 @@ def get_project_files(proj_path, allowed_extensions=None):
 
         for fn in filenames:
             rel_file = f"{rel_root}/{fn}".lstrip("/")
-            if is_ignored(rel_file, False, gi_patterns):
+            if is_ignored(rel_file, False, gi_patterns) or is_protected_path(rel_file):
                 continue
             ext = os.path.splitext(fn)[1].lower()
             if allow_all or ext in allowed_extensions:
